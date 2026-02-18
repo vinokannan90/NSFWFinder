@@ -125,22 +125,82 @@ class NSFWClassifier:
 
 
 # ---------------------------------------------------------------------------
+# Directories to skip (common Windows locked / system folders)
+# ---------------------------------------------------------------------------
+
+SKIP_DIR_NAMES = {
+    "$recycle.bin",
+    "system volume information",
+    "$windows.~bt",
+    "$windows.~ws",
+    "recovery",
+    "config.msi",
+    "windows.old",
+    "$sysreset",
+    "documents and settings",      # NTFS junction, often locked
+}
+
+# ---------------------------------------------------------------------------
 # File discovery
 # ---------------------------------------------------------------------------
 
+def _walk_error_handler(error: OSError) -> None:
+    """Called by os.walk when it cannot list a directory."""
+    logging.warning("Skipping inaccessible directory: %s  (%s)", error.filename, error)
+
+
 def discover_files(root: str) -> tuple[list[str], list[str]]:
-    """Walk *root* and return (image_files, video_files)."""
+    """Walk *root* and return (image_files, video_files).
+
+    Gracefully skips directories the current user cannot access
+    (e.g. locked system/user folders on a drive from another machine).
+    """
     images: list[str] = []
     videos: list[str] = []
+    skipped_dirs = 0
 
-    for dirpath, _, filenames in os.walk(root):
+    for dirpath, dirnames, filenames in os.walk(root, onerror=_walk_error_handler):
+        # ---- Prune known-locked / system directories in-place ----
+        original_count = len(dirnames)
+        dirnames[:] = [
+            d for d in dirnames
+            if d.lower() not in SKIP_DIR_NAMES
+        ]
+        skipped_dirs += original_count - len(dirnames)
+
+        # ---- Also prune any subdirectory we cannot access ----
+        accessible: list[str] = []
+        for d in dirnames:
+            full_dir = os.path.join(dirpath, d)
+            try:
+                os.listdir(full_dir)       # lightweight access check
+                accessible.append(d)
+            except PermissionError:
+                logging.warning("Skipping locked directory: %s", full_dir)
+                skipped_dirs += 1
+            except OSError as exc:
+                logging.warning("Skipping inaccessible directory: %s  (%s)", full_dir, exc)
+                skipped_dirs += 1
+        dirnames[:] = accessible
+
+        # ---- Collect files ----
         for fname in filenames:
             ext = os.path.splitext(fname)[1].lower()
             full = os.path.join(dirpath, fname)
+            try:
+                # Quick access check – avoids queuing files we can't read
+                os.path.getsize(full)
+            except (PermissionError, OSError):
+                logging.debug("Skipping inaccessible file: %s", full)
+                continue
+
             if ext in IMAGE_EXTENSIONS:
                 images.append(full)
             elif ext in VIDEO_EXTENSIONS:
                 videos.append(full)
+
+    if skipped_dirs:
+        logging.info("Skipped %d inaccessible/system directories.", skipped_dirs)
 
     return images, videos
 
@@ -155,6 +215,9 @@ def _load_image(path: str) -> Optional[Image.Image]:
         # Force decode by accessing pixel data (avoids lazy-load stalls later)
         img.load()
         return img
+    except PermissionError:
+        logging.warning("Permission denied reading file: %s", path)
+        return None
     except Exception as exc:
         logging.debug("Skipped %s: %s", path, exc)
         return None
@@ -184,7 +247,15 @@ def _image_producer(
         }
 
         for future in as_completed(futures):
-            path, img = future.result()
+            try:
+                path, img = future.result()
+            except (PermissionError, OSError) as exc:
+                logging.warning("Cannot read file %s: %s", futures[future], exc)
+                continue
+            except Exception as exc:
+                logging.debug("Unexpected error loading %s: %s", futures[future], exc)
+                continue
+
             if img is not None:
                 batch_paths.append(path)
                 batch_images.append(img)
@@ -257,27 +328,37 @@ def scan_images(
 def _extract_frames(video_path: str, num_frames: int) -> list[Image.Image]:
     """Extract *num_frames* evenly spaced frames from a video."""
     frames: list[Image.Image] = []
-    cap = cv2.VideoCapture(video_path)
+    try:
+        cap = cv2.VideoCapture(video_path)
+    except Exception as exc:
+        logging.warning("Cannot open video %s: %s", video_path, exc)
+        return frames
+
     if not cap.isOpened():
         logging.debug("Cannot open video: %s", video_path)
         return frames
 
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total_frames <= 0:
+    try:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            return frames
+
+        step = max(total_frames // (num_frames + 1), 1)
+        target_indices = [step * (i + 1) for i in range(num_frames)]
+
+        for idx in target_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, min(idx, total_frames - 1))
+            ret, frame = cap.read()
+            if ret:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames.append(Image.fromarray(rgb))
+    except PermissionError:
+        logging.warning("Permission denied reading video: %s", video_path)
+    except Exception as exc:
+        logging.warning("Error extracting frames from %s: %s", video_path, exc)
+    finally:
         cap.release()
-        return frames
 
-    step = max(total_frames // (num_frames + 1), 1)
-    target_indices = [step * (i + 1) for i in range(num_frames)]
-
-    for idx in target_indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, min(idx, total_frames - 1))
-        ret, frame = cap.read()
-        if ret:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(Image.fromarray(rgb))
-
-    cap.release()
     return frames
 
 
@@ -305,7 +386,15 @@ def _video_producer(
         }
 
         for future in as_completed(futures):
-            vpath, frames = future.result()
+            try:
+                vpath, frames = future.result()
+            except (PermissionError, OSError) as exc:
+                logging.warning("Cannot read video %s: %s", futures[future], exc)
+                continue
+            except Exception as exc:
+                logging.debug("Unexpected error decoding %s: %s", futures[future], exc)
+                continue
+
             if frames:
                 out_queue.put((vpath, frames))
 
@@ -509,6 +598,7 @@ def main() -> None:
 
     # ---- Discover files -----------------------------------------------------
     logging.info("Discovering files in %s …", scan_root)
+    logging.info("Locked/system folders will be skipped automatically.")
     image_paths, video_paths = discover_files(scan_root)
     logging.info("Found %d images and %d videos.", len(image_paths), len(video_paths))
 
