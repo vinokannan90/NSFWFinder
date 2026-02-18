@@ -1,0 +1,17 @@
+--index-url https://download.pytorch.org/whl/cu124
+--extra-index-url https://pypi.org/simple
+
+# PyTorch with CUDA 12.4 (includes CUDA runtime + cuDNN — no separate install needed)
+torch>=2.0.0
+torchvision>=0.15.0
+
+# AI / ML
+transformers>=4.36.0
+
+# Image & video processing
+Pillow>=10.0.0
+opencv-python>=4.8.0
+
+# Utilities
+tqdm>=4.65.0
+send2trash>=1.8.0

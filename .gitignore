@@ -1,0 +1,32 @@
+# Virtual environment
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Scanner output (user-specific, should not be checked in)
+nsfw_report.csv
+FindingsToReview/
+backup.csv
+
+# Model cache (downloaded automatically)
+*.safetensors
+*.bin
