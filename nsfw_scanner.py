@@ -236,34 +236,46 @@ def _image_producer(
     batch_size: int,
     out_queue: queue.Queue,
 ):
-    """I/O thread: load images in parallel and push ready batches into queue."""
+    """I/O thread: load images in parallel and push ready batches into queue.
+
+    Processes paths in bounded chunks so that at most
+    (chunk_size) decoded PIL images are alive in memory at any time,
+    preventing the MemoryError that occurs when all futures are
+    submitted at once for very large file lists.
+    """
     batch_paths: list[str] = []
     batch_images: list[Image.Image] = []
 
-    with ThreadPoolExecutor(max_workers=IO_WORKERS) as pool:
-        futures = {
-            pool.submit(_load_image_with_path, p): p
-            for p in image_paths
-        }
+    # Only keep a bounded number of decoded images in flight at once.
+    chunk_size = batch_size * PREFETCH_BATCHES
 
-        for future in as_completed(futures):
-            try:
-                path, img = future.result()
-            except (PermissionError, OSError) as exc:
-                logging.warning("Cannot read file %s: %s", futures[future], exc)
-                continue
-            except Exception as exc:
-                logging.debug("Unexpected error loading %s: %s", futures[future], exc)
-                continue
+    for start in range(0, len(image_paths), chunk_size):
+        chunk = image_paths[start : start + chunk_size]
 
-            if img is not None:
-                batch_paths.append(path)
-                batch_images.append(img)
+        with ThreadPoolExecutor(max_workers=IO_WORKERS) as pool:
+            futures = {
+                pool.submit(_load_image_with_path, p): p
+                for p in chunk
+            }
 
-                if len(batch_images) >= batch_size:
-                    out_queue.put((list(batch_paths), list(batch_images)))
-                    batch_paths.clear()
-                    batch_images.clear()
+            for future in as_completed(futures):
+                try:
+                    path, img = future.result()
+                except (PermissionError, OSError) as exc:
+                    logging.warning("Cannot read file %s: %s", futures[future], exc)
+                    continue
+                except Exception as exc:
+                    logging.debug("Unexpected error loading %s: %s", futures[future], exc)
+                    continue
+
+                if img is not None:
+                    batch_paths.append(path)
+                    batch_images.append(img)
+
+                    if len(batch_images) >= batch_size:
+                        out_queue.put((list(batch_paths), list(batch_images)))
+                        batch_paths.clear()
+                        batch_images.clear()
 
     # Flush remaining
     if batch_images:
