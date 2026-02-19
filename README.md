@@ -98,6 +98,7 @@ This single command installs **everything** you need:
 | **Pillow** | Image file handling |
 | **OpenCV** | Video frame extraction |
 | **tqdm** | Progress bars |
+| **psutil** | System RAM monitoring (memory guard) |
 | **send2trash** | Recycle Bin support for safe deletion |
 
 > **No separate CUDA, cuDNN, or CUDA Toolkit installation is needed.** The PyTorch CUDA wheel bundles everything.
@@ -144,6 +145,7 @@ python nsfw_scanner.py F:\ --batch-size 48 --io-workers 12 --video-workers 6
 | `--io-workers` | `8` | I/O threads for loading files |
 | `--video-workers` | `4` | Threads for video decoding |
 | `--cpu` | off | Force CPU-only mode |
+| `--max-memory` | auto | Max system RAM (GB) for the scanner. Default: total RAM minus 4 GB headroom |
 | `--verbose, -v` | off | Enable debug logging |
 
 **Output:** A `nsfw_report.csv` file listing all flagged files with their NSFW scores.

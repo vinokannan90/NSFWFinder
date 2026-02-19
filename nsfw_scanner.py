@@ -33,10 +33,15 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import cv2
+import psutil
 import torch
 from PIL import Image
 from tqdm import tqdm
 from transformers import AutoModelForImageClassification, ViTImageProcessor
+
+# Suppress noisy FFmpeg/OpenCV warnings that flood stderr on corrupt videos
+os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")  # silent
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -56,6 +61,10 @@ MODEL_NAME = "Falconsai/nsfw_image_detection"
 IO_WORKERS = 8          # threads for reading files from disk
 PREFETCH_BATCHES = 4    # number of batches to prefetch ahead of GPU
 VIDEO_DECODE_WORKERS = 4  # threads for parallel video decoding
+MAX_FRAME_DIM = 384     # resize extracted frames to fit this box (saves RAM)
+VIDEO_DECODE_TIMEOUT = 120  # seconds – skip videos that take longer to decode
+MEMORY_HEADROOM_GB = 4.0    # GB reserved for OS + other apps (never exceed total - this)
+MEMORY_CHECK_INTERVAL = 0.5 # seconds between memory pressure re-checks while paused
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -72,6 +81,69 @@ class ScanResult:
 
 # Sentinel value to signal end of queue
 _SENTINEL = None
+
+
+# ---------------------------------------------------------------------------
+# Memory guardian
+# ---------------------------------------------------------------------------
+
+class MemoryGuard:
+    """Prevents the scanner from consuming all system RAM.
+
+    Producers call ``wait_if_pressure()`` before loading data.  If the
+    process RSS (or total system usage) exceeds the configured ceiling
+    the call **blocks** until memory drops back below the limit — giving
+    the GPU consumer time to process and free batches.
+    """
+
+    def __init__(self, max_usage_gb: Optional[float] = None):
+        total_gb = psutil.virtual_memory().total / (1024 ** 3)
+
+        if max_usage_gb is not None and max_usage_gb > 0:
+            self._ceiling_bytes = int(max_usage_gb * 1024 ** 3)
+        else:
+            # Auto: allow up to (total RAM − headroom)
+            safe_gb = max(total_gb - MEMORY_HEADROOM_GB, total_gb * 0.5)
+            self._ceiling_bytes = int(safe_gb * 1024 ** 3)
+
+        self._ceiling_gb = self._ceiling_bytes / (1024 ** 3)
+        self._warned = False
+        logging.info(
+            "Memory guard: system has %.1f GB RAM → scanner limited to %.1f GB "
+            "(%.1f GB reserved for OS).",
+            total_gb, self._ceiling_gb, total_gb - self._ceiling_gb,
+        )
+
+    # ----- public API -----
+
+    def wait_if_pressure(self) -> None:
+        """Block the calling (producer) thread while memory usage is too high."""
+        while self._system_used_bytes() > self._ceiling_bytes:
+            if not self._warned:
+                used_gb = self._system_used_bytes() / (1024 ** 3)
+                logging.warning(
+                    "Memory pressure: %.1f / %.1f GB used — "
+                    "producer paused until GPU consumer frees memory.",
+                    used_gb, self._ceiling_gb,
+                )
+                self._warned = True
+            time.sleep(MEMORY_CHECK_INTERVAL)
+
+        # Reset the one-shot warning once pressure is relieved
+        if self._warned:
+            logging.info("Memory pressure relieved — producer resuming.")
+            self._warned = False
+
+    @property
+    def ceiling_gb(self) -> float:
+        return self._ceiling_gb
+
+    # ----- internals -----
+
+    @staticmethod
+    def _system_used_bytes() -> int:
+        """Return total system RAM currently in use (bytes)."""
+        return psutil.virtual_memory().used
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +307,7 @@ def _image_producer(
     image_paths: list[str],
     batch_size: int,
     out_queue: queue.Queue,
+    mem_guard: MemoryGuard,
 ):
     """I/O thread: load images in parallel and push ready batches into queue.
 
@@ -250,6 +323,9 @@ def _image_producer(
     chunk_size = batch_size * PREFETCH_BATCHES
 
     for start in range(0, len(image_paths), chunk_size):
+        # ---- Memory guard: pause if system RAM is under pressure ----
+        mem_guard.wait_if_pressure()
+
         chunk = image_paths[start : start + chunk_size]
 
         with ThreadPoolExecutor(max_workers=IO_WORKERS) as pool:
@@ -289,6 +365,7 @@ def scan_images(
     image_paths: list[str],
     threshold: float,
     batch_size: int,
+    mem_guard: MemoryGuard,
 ) -> list[ScanResult]:
     """Classify all images using a producer/consumer pipeline."""
     results: list[ScanResult] = []
@@ -299,7 +376,7 @@ def scan_images(
 
     producer = threading.Thread(
         target=_image_producer,
-        args=(image_paths, batch_size, prefetch_q),
+        args=(image_paths, batch_size, prefetch_q, mem_guard),
         daemon=True,
     )
     producer.start()
@@ -337,8 +414,24 @@ def scan_images(
 # Video frame extraction
 # ---------------------------------------------------------------------------
 
+def _resize_frame(img: Image.Image, max_dim: int = MAX_FRAME_DIM) -> Image.Image:
+    """Down-scale a PIL image so its longest side is at most *max_dim*.
+
+    The ViT model only needs 224×224, so keeping full 4K frames in RAM
+    is wasteful (~24 MB each vs. ~0.4 MB after resize).
+    """
+    w, h = img.size
+    if max(w, h) <= max_dim:
+        return img
+    scale = max_dim / max(w, h)
+    return img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+
 def _extract_frames(video_path: str, num_frames: int) -> list[Image.Image]:
-    """Extract *num_frames* evenly spaced frames from a video."""
+    """Extract *num_frames* evenly spaced frames from a video.
+
+    Frames are immediately resized to MAX_FRAME_DIM to keep memory low.
+    """
     frames: list[Image.Image] = []
     try:
         cap = cv2.VideoCapture(video_path)
@@ -363,7 +456,9 @@ def _extract_frames(video_path: str, num_frames: int) -> list[Image.Image]:
             ret, frame = cap.read()
             if ret:
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frames.append(Image.fromarray(rgb))
+                pil_img = _resize_frame(Image.fromarray(rgb))
+                del frame, rgb          # free the full-res numpy arrays NOW
+                frames.append(pil_img)
     except PermissionError:
         logging.warning("Permission denied reading video: %s", video_path)
     except Exception as exc:
@@ -389,26 +484,50 @@ def _video_producer(
     video_paths: list[str],
     num_frames: int,
     out_queue: queue.Queue,
+    mem_guard: MemoryGuard,
 ):
-    """Decode videos in parallel threads and push frames into queue."""
-    with ThreadPoolExecutor(max_workers=VIDEO_DECODE_WORKERS) as pool:
-        futures = {
-            pool.submit(_extract_video_data, vp, num_frames): vp
-            for vp in video_paths
-        }
+    """Decode videos in parallel threads and push frames into queue.
 
-        for future in as_completed(futures):
-            try:
-                vpath, frames = future.result()
-            except (PermissionError, OSError) as exc:
-                logging.warning("Cannot read video %s: %s", futures[future], exc)
-                continue
-            except Exception as exc:
-                logging.debug("Unexpected error decoding %s: %s", futures[future], exc)
-                continue
+    Processes videos in bounded chunks (like _image_producer) so that at
+    most `chunk_size` decoded frame-sets are alive in memory at any time.
+    This prevents the runaway RAM growth that occurs when all futures are
+    submitted at once for very large video collections.
+    """
+    # Keep at most this many videos decoded in memory at once.
+    chunk_size = max(VIDEO_DECODE_WORKERS * PREFETCH_BATCHES, 8)
 
-            if frames:
-                out_queue.put((vpath, frames))
+    for start in range(0, len(video_paths), chunk_size):
+        # ---- Memory guard: pause if system RAM is under pressure ----
+        mem_guard.wait_if_pressure()
+
+        chunk = video_paths[start : start + chunk_size]
+
+        with ThreadPoolExecutor(max_workers=VIDEO_DECODE_WORKERS) as pool:
+            futures = {
+                pool.submit(_extract_video_data, vp, num_frames): vp
+                for vp in chunk
+            }
+
+            for future in as_completed(futures):
+                try:
+                    vpath, frames = future.result(
+                        timeout=VIDEO_DECODE_TIMEOUT
+                    )
+                except TimeoutError:
+                    logging.warning(
+                        "Skipping video (decode timed out after %ds): %s",
+                        VIDEO_DECODE_TIMEOUT, futures[future],
+                    )
+                    continue
+                except (PermissionError, OSError) as exc:
+                    logging.warning("Cannot read video %s: %s", futures[future], exc)
+                    continue
+                except Exception as exc:
+                    logging.debug("Unexpected error decoding %s: %s", futures[future], exc)
+                    continue
+
+                if frames:
+                    out_queue.put((vpath, frames))
 
     out_queue.put(_SENTINEL)
 
@@ -419,6 +538,7 @@ def scan_videos(
     threshold: float,
     num_frames: int,
     batch_size: int,
+    mem_guard: MemoryGuard,
 ) -> list[ScanResult]:
     """Classify videos using a pipelined producer/consumer approach."""
     results: list[ScanResult] = []
@@ -427,7 +547,7 @@ def scan_videos(
 
     producer = threading.Thread(
         target=_video_producer,
-        args=(video_paths, num_frames, prefetch_q),
+        args=(video_paths, num_frames, prefetch_q, mem_guard),
         daemon=True,
     )
     producer.start()
@@ -569,6 +689,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable verbose/debug logging.",
     )
+    parser.add_argument(
+        "--max-memory",
+        type=float,
+        default=0,
+        help="Maximum system RAM (GB) the scanner may use.  "
+             "Default: auto (total RAM minus 4 GB headroom for OS).",
+    )
     return parser.parse_args()
 
 
@@ -618,6 +745,11 @@ def main() -> None:
         print("No image or video files found. Nothing to scan.")
         return
 
+    # ---- Memory guard -------------------------------------------------------
+    mem_guard = MemoryGuard(
+        max_usage_gb=args.max_memory if args.max_memory > 0 else None,
+    )
+
     # ---- Load model ---------------------------------------------------------
     classifier = NSFWClassifier(device=device, half_precision=(device == "cuda"))
 
@@ -626,13 +758,16 @@ def main() -> None:
     results: list[ScanResult] = []
 
     if image_paths:
-        results.extend(scan_images(classifier, image_paths, args.threshold, args.batch_size))
+        results.extend(
+            scan_images(classifier, image_paths, args.threshold,
+                        args.batch_size, mem_guard)
+        )
 
     if video_paths:
-        results.extend(scan_videos(
-            classifier, video_paths, args.threshold,
-            args.video_frames, args.batch_size,
-        ))
+        results.extend(
+            scan_videos(classifier, video_paths, args.threshold,
+                        args.video_frames, args.batch_size, mem_guard)
+        )
 
     elapsed = time.perf_counter() - start
     logging.info("Scan completed in %.1f seconds.", elapsed)
